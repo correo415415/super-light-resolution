@@ -1,0 +1,7 @@
+# Dependencias mínimas. PyTorch se instala aparte según tu CUDA:
+#   https://pytorch.org/get-started/locally/
+torch>=2.0
+numpy>=1.24
+opencv-python>=4.8
+tensorboard>=2.14
+tqdm>=4.65

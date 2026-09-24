@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.venv/
+venv/
+
+# Datos y artefactos de entrenamiento
+data/
+datasets/
+checkpoints/
+runs/
+outputs/
+*.pth
+*.pt
+*.ckpt
+!tests/fixtures/*.pt
+
+# Vídeos / imágenes generadas
+*.mp4
+*.avi
+*.mkv
+*.gif
+outputs_vis/
+
+# IDE / SO
+.vscode/
+.idea/
+.DS_Store
