@@ -9,6 +9,7 @@ Uso básico (una URL de YouTube o un fichero local):
         --start 00:01:00 --duration 10 --height 720 --out_dir outputs/demo1
 
     python demo_video.py --ckpt ... --source mi_video.mp4 --exp 2 --out_dir outputs/demo2
+    python demo_video.py --ckpt rifem.pth --source pelicula_24fps.mp4 --multi 3 --out_dir outputs/demo3  # RIFE-m ×3
 
 Varias fuentes a la vez (batch), desde un fichero de texto (una por línea,
 "url_o_ruta [start] [duration]"):
@@ -18,7 +19,7 @@ Varias fuentes a la vez (batch), desde un fichero de texto (una por línea,
 Qué produce, para cada fuente, en `out_dir/<nombre>/`:
 
     input.mp4          clip original recortado (H = --height)
-    interp_x2.mp4      resultado interpolado (×2^exp fps)
+    interp_xN.mp4      resultado interpolado (×N fps; N = 2^exp o --multi)
     sidebyside.mp4     original (izq) | interpolado (der), a la fps del interpolado,
                        el original repite frames → se ve la diferencia de fluidez
     slowmo.mp4         el interpolado reproducido a la fps del original (cámara lenta)
@@ -152,8 +153,8 @@ def is_scene_cut(a: np.ndarray, b: np.ndarray, thresh: float = 0.35) -> bool:
 # ---------------------------------------------------------------------------
 # Núcleo de la demo
 # ---------------------------------------------------------------------------
-def interpolate_frames(frames, interp: Interpolator, exp: int, device, scene_thresh: float, verbose=True):
-    """Devuelve la lista de frames interpolados (BGR) y estadísticas."""
+def interpolate_frames(frames, interp: Interpolator, factor: int, device, scene_thresh: float, verbose=True):
+    """Devuelve la lista de frames interpolados (BGR, ×factor) y estadísticas."""
     out = [frames[0]]
     n_cuts = 0
     t0 = time.time()
@@ -163,9 +164,9 @@ def interpolate_frames(frames, interp: Interpolator, exp: int, device, scene_thr
         cur_t = bgr_to_tensor(cur, device)
         if is_scene_cut(frames[i - 1], cur, scene_thresh):
             n_cuts += 1
-            out.extend([frames[i - 1]] * (2**exp - 1))  # duplicar en vez de interpolar
+            out.extend([frames[i - 1]] * (factor - 1))  # duplicar en vez de interpolar
         else:
-            out.extend(tensor_to_bgr(m) for m in interp.between(prev_t, cur_t, exp))
+            out.extend(tensor_to_bgr(m) for m in interp.multi(prev_t, cur_t, factor))
         out.append(cur)
         prev_t = cur_t
         if verbose and i % 60 == 0:
@@ -250,9 +251,9 @@ def run_one(source: str, start, duration, args, interp: Interpolator, device) ->
     h, w = frames[0].shape[:2]
     print(f"  {len(frames)} frames @ {fps:.2f} fps, {w}x{h}")
 
-    # 1) Interpolación ×2^exp
-    interp_frames, stats = interpolate_frames(frames, interp, args.exp, device, args.scene_thresh)
-    factor = 2**args.exp
+    # 1) Interpolación ×factor (2^exp recursivo, o --multi N directo con RIFE-m)
+    factor = args.multi if args.multi else 2**args.exp
+    interp_frames, stats = interpolate_frames(frames, interp, factor, device, args.scene_thresh)
     write_video(out_dir / f"interp_x{factor}.mp4", interp_frames, fps * factor)
     write_video(out_dir / "slowmo.mp4", interp_frames, fps)
     write_video(out_dir / "sidebyside.mp4", side_by_side(frames, interp_frames, factor), fps * factor)
@@ -291,7 +292,8 @@ def main():
     p.add_argument("--start", type=str, default=None, help="inicio del recorte (hh:mm:ss)")
     p.add_argument("--duration", type=float, default=8.0, help="segundos del clip")
     p.add_argument("--height", type=int, default=720, help="altura de trabajo (360/540/720/1080)")
-    p.add_argument("--exp", type=int, default=1, help="×2^exp")
+    p.add_argument("--exp", type=int, default=1, help="×2^exp (recursivo)")
+    p.add_argument("--multi", type=int, default=None, help="×N directo (RIFE-m; cualquier N, p.ej. 3 para 24→72 fps)")
     p.add_argument("--scales", type=float, nargs=3, default=(4, 2, 1))
     p.add_argument("--tile", type=int, default=0)
     p.add_argument("--tile_overlap", type=int, default=64)
