@@ -203,6 +203,33 @@ def test_convert_rife_to_rifem_is_identity():
     assert all(k.startswith("ifnet.teacher") for k in info2["skipped"])
 
 
+def test_ema_swap_and_export():
+    """EMA: update sigue la fórmula; apply_to intercambia pesos y los restaura;
+    un export dentro del `with` NO debe quedar aliasado a los pesos vivos."""
+    from train import EMA
+
+    torch.manual_seed(5)
+    m = RIFE(ifnet_widths=(16, 12, 8), refine_c=4)
+    ema = EMA(m, 0.9)
+    k = "ifnet.blocks.0.encoder.0.0.weight"
+    w0 = m.state_dict()[k].clone()
+    with torch.no_grad():
+        for p in m.parameters():
+            p.add_(1.0)
+    ema.update(m)
+    assert torch.allclose(ema.shadow[k], 0.9 * w0 + 0.1 * (w0 + 1.0), atol=1e-6)
+    live = m.state_dict()[k].clone()
+    with ema.apply_to(m) as raw:
+        assert torch.allclose(raw.state_dict()[k], ema.shadow[k])
+        exported = {kk: v.detach().clone() for kk, v in raw.export_inference_state_dict().items()}
+    assert torch.allclose(m.state_dict()[k], live), "los pesos no se restauraron"
+    assert torch.allclose(exported[k], ema.shadow[k]), "el export debe llevar pesos EMA"
+    # round-trip de estado
+    ema2 = EMA(m, 0.5)
+    ema2.load_state_dict(ema.state_dict())
+    assert ema2.decay == 0.9 and torch.allclose(ema2.shadow[k], ema.shadow[k])
+
+
 if __name__ == "__main__":
     import inspect
 

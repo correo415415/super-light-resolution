@@ -607,7 +607,9 @@ def main():
         raw = model.module if isinstance(model, DDP) else model
         if ema is not None:
             with ema.apply_to(model):
-                inf_state = raw.export_inference_state_dict()
+                # clone: state_dict() devuelve referencias a los parámetros y al
+                # salir del `with` se restauran los pesos originales in-place.
+                inf_state = {k: v.detach().clone() for k, v in raw.export_inference_state_dict().items()}
         else:
             inf_state = raw.export_inference_state_dict()
         torch.save({"model": inf_state, "args": vars(args)}, out_dir / "inference.pth")
