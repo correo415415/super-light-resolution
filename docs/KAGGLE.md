@@ -183,3 +183,69 @@ usarlo en tu 3060 con `inference.py`.
 | `CUDA out of memory` | `--grad_checkpoint`, `--batch_size 12`, o `--refine_c 8`. |
 | La sesión murió y no hay output | No usaste `--time_limit`, o el margen era pequeño.  Usa 11.0 para ir seguro. |
 | Loss NaN | Revisa `--weight_decay 1e-3` (AdamW).  Si persiste, `--lr 2e-4` y `--grad_clip 0.5`. |
+
+---
+
+## 9. Run 2: RIFE-m fine-tune sobre Vimeo **septuplet**
+
+El run 1 (60 épocas, triplet) dio **34.33 dB / 0.957 SSIM** y la curva estaba saturada
+(≈ +0.02 dB/época al final).  Seguir con la misma receta no compensa.  El run 2 cambia
+tres cosas a la vez, cada una con motivación clara:
+
+| Cambio | Flag | Por qué |
+|---|---|---|
+| **RIFE-m** (timestep arbitrario) | `--arbitrary_time` | Necesario para ×3, ×5… directos y para la app tipo Lossless Scaling (generar el frame en el t exacto que toca, no siempre 0.5).  Añade 1 canal de entrada por IFBlock (7/18/18/21). |
+| **Septuplet** en vez de triplet | dataset con `sep_trainlist.txt` | RIFE-m necesita GT en t≠0.5: con 7 frames se muestrean (i0, it, i1) y t=(it−i0)/(i1−i0).  Además el septuplet **incluye** el triplet (gap 2, centro) y añade movimiento hasta 3× mayor (gap 6). |
+| **Fine-tune desde el run 1** | `--init_from best.pth` | La conversión RIFE→RIFE-m pone el canal t a **cero** → el modelo arranca numéricamente idéntico al run 1 (34.3 dB) y sólo tiene que aprender a *usar* t.  Entrenar RIFE-m desde cero costaría otras 2–3 sesiones para llegar al mismo sitio. |
+| **EMA de pesos** | `--ema 0.999` | Media móvil de los pesos; se valida y exporta con ella.  Típicamente +0.1–0.3 dB y menos ruido época a época.  Se guarda en el checkpoint, reanudable. |
+| **Scale augmentation** | `--scale_aug 0.5 0.5 1.5` | Recomendación de hzwer (autor de RIFE) para cerrar el gap entre entrenamiento (448×256, movimiento pequeño) e inferencia (1080p, movimiento grande). |
+| Distill weight | `--distill_weight` (auto 0.005) | El paper usa 0.005 para RIFE-m (0.01 para RIFE). |
+| LR más bajo | `--lr 1e-4 --warmup_steps 500 --no_lr_scale` | Es un fine-tune: no queremos destruir lo aprendido en las primeras iteraciones. |
+
+### 9.1 Dataset septuplet en Kaggle
+
+`vimeo_septuplet.zip` oficial son 82 GB (http://toflow.csail.mit.edu/).  Mirrors públicos en
+Kaggle en el momento de escribir esto (búscalos en https://www.kaggle.com/datasets?search=vimeo+septuplet
+y comprueba que contengan `sep_trainlist.txt`, `sep_testlist.txt` y `sequences/*/*/im1..im7.png`):
+
+| Dataset Kaggle | Tamaño | Comentario |
+|---|---|---|
+| `maiimaii/vimeo-septuplet` (título "dataset_mai") | 87.9 GB, 642k ficheros | Carpeta `vimeo_septuplet/` — tamaño compatible con el dataset completo (91 701 secuencias) |
+| `wangsally/vimeo-90k-7` | ? | Otro mirror del septuplet |
+
+El notebook localiza la raíz con `glob('/kaggle/input/**/sep_trainlist.txt')`.  Ojo: 88 GB en
+`/kaggle/input` (disco de red) → la primera época puede ir más lenta por la caché; `--num_workers 4`
+y batch 16 por GPU fueron suficientes en el run 1 (10 min/época sobre 51k tríos).  El septuplet
+tiene 64 612 secuencias de train → **≈13–15 min/época**, ≈45 épocas por sesión de 11.2 h.
+
+### 9.2 Plan de sesiones
+
+```
+sesión 1: --init_from best.pth(run 1) --arbitrary_time --ema 0.999 --scale_aug 0.5 0.5 1.5 --epochs 90 --time_limit 11.2
+          → ~45 épocas.  Guarda versión.
+sesión 2: --resume checkpoints_run2/last.pth (mismo --epochs 90)  → completa el coseno.
+(sesión 3, opcional): --resume con --epochs 135 ⇒ OJO: cambiar --epochs alarga el coseno y sube el LR de golpe;
+          si vas a hacerlo, decide el total ANTES de la sesión 1.)
+```
+
+El notebook `docs/kaggle_notebook.ipynb` ya está configurado así (celda 1: `INIT_FROM`/`RESUME`).
+
+### 9.3 Qué mirar en los resultados
+
+1. **Validación t=0.5 (test septuplet, im3→im5)**: debe empezar ≈ al nivel del run 1 y no bajar.
+   El paper reporta RIFE-m ≈0.1 dB por debajo de RIFE en t=0.5; EMA y scale-aug deberían compensar.
+   Los números no son directamente comparables con el 34.33 del test triplet (otro conjunto).
+2. **`evaluate.py --multi_t`** (im1→im7, t=1/6…5/6): un RIFE clásico convertido se hunde en
+   t=1/6 y 5/6 (predice siempre el centro).  RIFE-m fine-tuneado debe dar PSNR parecido en los 5 t.
+   Ésta es la prueba de que el canal t se ha aprendido.
+3. **Drop-frame eval en vídeos reales** (`demo_video.py`, sin GT): PSNR de reconstruir frames
+   impares a partir de los pares.  Compara run 1 vs run 2 en los mismos clips de `docs/demo_sources.txt`.
+
+### 9.4 Limitaciones de `--init_from`
+
+* `--refine_c` y `--ifnet_widths` **deben coincidir** con el checkpoint origen; si no, esos
+  tensores se omiten (quedan aleatorios) y el fine-tune pierde sentido.  El log imprime
+  `N tensores copiados, 4 adaptados RIFE→RIFE-m, M omitidos` — M debe ser 0 (o sólo teacher si
+  partes de `inference.pth`).
+* `--init_from` se ignora si hay `--resume` (el resume ya trae los pesos).
+* Se prefieren los pesos EMA del checkpoint origen si los tiene.
