@@ -110,9 +110,10 @@ Notas sobre los flags:
   Deja margen para que el notebook termine y Kaggle empaquete el output antes del límite
   de 12 h.  **Sin esto pierdes la sesión entera si Kaggle la mata.**
 * `--epochs`: fija el TOTAL de épocas del plan (determina el schedule de LR).  Con 2×T4,
-  batch 16×2 y AMP, una época de Vimeo (~1 600 pasos) tarda ≈ 12-15 min → ≈ 45 épocas por
-  sesión de 11 h.  El paper usa 300 épocas; con tu cuota (30 h/semana ≈ 2.5 sesiones) un
-  plan realista es **60-100 épocas en 2-4 sesiones** (ver resultados esperados en el README).
+  batch 16×2 y AMP, una época de Vimeo (1 603 pasos) tarda **10.1 min medidos** → ≈ 65 épocas
+  por sesión de 11 h.  El run 1 (60 épocas, 34.33 dB) cupo en una sola sesión.  El paper usa
+  300 épocas; con tu cuota (30 h/semana ≈ 2.5 sesiones) un plan realista es **150-180 épocas
+  en 3 sesiones** (ver resultados en el README).
   No cambies `--epochs` entre sesiones o el schedule de LR se desalinea.
 * `--save_every 500` → `last.pth` se refresca cada ~4 min.
 * `--num_workers 4`: Kaggle da 4 vCPU; con 2 procesos DDP son 4 workers por proceso = 8

@@ -165,14 +165,18 @@ python train.py --data_root /data/vimeo_triplet --smoke --amp --out_dir runs/smo
 pasos.  Al final imprime la **comprobación de cordura**:
 
 ```
-[val] epoch 2 psnr 27.8 ssim 0.88 (baseline promedio: 22.1 dB)
-[SMOKE ✓] modelo 27.80 dB > baseline 22.10 dB
+[val] epoch 2 psnr 27.1 ssim 0.81 (baseline promedio: 25.6 dB)
+[SMOKE ✓] modelo 27.10 dB > baseline 25.60 dB
 ```
 
-El baseline es `PSNR((I₀+I₁)/2, I_t)`, que en Vimeo90K da **~20-23 dB**.  Si tras 3 épocas
-de smoke el modelo está **por debajo**, hay un bug (típicamente: signo del flujo, orden
+El baseline es `PSNR((I₀+I₁)/2, I_t)`, que en el test set de Vimeo90K da **25.6 dB medidos**
+(el brief asumía 20-23 dB; esa cifra corresponde a datasets con más movimiento).  Si tras 3
+épocas de smoke el modelo está **por debajo**, hay un bug (típicamente: signo del flujo, orden
 (x, y) en el warp, normalización de datos, o gt desalineado por una augmentación mal
-aplicada).  Con 512 tríos y 3 épocas el modelo debería estar en ~24-28 dB.
+aplicada).  Referencia real: con el dataset completo la red pasa el baseline dentro de la
+primera época (27.8 dB tras 1 603 pasos, ver §8); con 512 tríos y 3 épocas (~190 pasos)
+espera 26-28 dB.  Si sólo llegas a 25.6-26 dB probablemente sea normal por tan pocos pasos:
+sube a `--max_samples 2000` antes de sospechar un bug.
 
 Con el dataset sintético el baseline es más alto (~25 dB, fondos planos) y el modelo lo
 supera tras ~100 pasos.
@@ -193,7 +197,7 @@ python train.py --data_root /data/vimeo_triplet --out_dir runs/rife_local \
 
 Batch 12 con AMP cabe en 12 GB; con `--grad_checkpoint` cabe 16.  El LR se escala
 automáticamente por `world_size/4` (con 1 GPU: 7.5e-5 → usa `--no_lr_scale` si quieres 3e-4).
-Una época tarda ~20-25 min en la 3060.
+Una época tarda ~20-25 min en la 3060 (en 2×T4 con AMP: 10.1 min medidos).
 
 ### Kaggle 2×T4 (DDP)
 
@@ -261,21 +265,52 @@ Velocidad esperada en la 3060 con `--fp16`: ~25-30 fps de entrada a 720p, ~10-12
 
 ---
 
-## 8. Resultados esperados
+## 8. Resultados
 
-Vimeo90K test (448×256, PSNR promediado por imagen):
+### Run 1 — Kaggle 2×T4, 60 épocas, una sola sesión (~10 h)
 
-| Configuración | PSNR | SSIM |
+Configuración exacta: `torchrun --nproc_per_node=2 train.py --epochs 60 --batch_size 16 --amp
+--num_workers 4` (LR efectivo 1.5e-4 = 3e-4 × 2/4, warmup 2000, coseno → 1.5e-6).
+**10.1 min/época**, 96 180 pasos, sin NaN ni reinicios.  Datos: `docs/results/`.
+
+| Vimeo90K test (448×256) | PSNR | SSIM |
 |---|---|---|
-| Baseline (I₀+I₁)/2 | ~20-23 dB | ~0.65 |
-| Smoke test (512 tríos, 3 épocas) | 24-28 dB | ~0.85 |
-| ~10 épocas completas (1 sesión Kaggle) | ~32-33 dB | ~0.96 |
-| ~60 épocas (3-4 sesiones) | ~34-34.5 dB | ~0.975 |
-| 300 épocas (paper, 4 GPUs) | **35.6 dB** | 0.980 |
+| Baseline (I₀+I₁)/2 | 25.6 dB | 0.77 |
+| Época 1 | 27.8 dB | 0.819 |
+| Época 2 | 30.9 dB | 0.900 |
+| Época 10 | 33.3 dB | 0.945 |
+| Época 30 | 34.1 dB | 0.955 |
+| **Época 60 (best.pth), 3 782 tríos** | **34.33 dB** | **0.957** |
+| Misma red, 500 primeros tríos (`eval.json`) | 34.40 dB | 0.958 |
+| RIFE paper, 300 épocas, 4 GPUs | 35.6 dB | 0.980 |
 
-La curva es muy pronunciada al principio (la mayor parte del PSNR se gana en las primeras
-10 épocas) y luego lenta; el último dB cuesta ~200 épocas.  Con 30 h/semana, **60-100 épocas
-en 2-4 sesiones** es un objetivo realista que debería darte 34-35 dB.
+Curva de validación completa en `docs/results/val_curve_run1.csv`.  Observaciones:
+
+* **La curva es logarítmica**: +3 dB en la época 2, +5.5 dB en la 10, y sólo +1 dB más en las
+  50 restantes.  El último tramo (ep 50→60, LR < 1e-5) aporta 0.02 dB: el schedule coseno ya
+  estaba "apagado".  Para seguir mejorando hay que entrenar con un plan más largo desde el
+  inicio (`--epochs 150`), no reanudar este.
+* **Distribución por muestra** (500 tríos): p5 = 27.0, mediana = 34.0, p95 = 42.7 dB.  43/500
+  muestras por debajo de 28 dB, todas con movimiento grande u oclusiones fuertes
+  (peor: `00003/0115` a 22.8 dB).  Ahí está el margen de mejora.
+* **La cascada funciona como debe** (`docs/results/blocks_00001_0402.png`): la fusión mejora
+  bloque a bloque (37.3 → 38.1 → 40.2 dB en esa muestra) y la máscara se activa sólo en
+  bordes de oclusión.
+* Inferencia: **7.4 ms/frame** a 448×256 en T4 con fp16 (≈135 fps).
+* Baseline real de promediar: **25.6 dB** en Vimeo90K, no 20-23 como asumía el brief (esa
+  cifra corresponde a datasets con más movimiento, p.ej. UCF101/SNU-FILM hard).
+
+### Diferencia con el paper (−1.3 dB) y cómo cerrarla
+
+| Causa probable | Impacto estimado | Acción |
+|---|---|---|
+| 60 vs 300 épocas | ~0.6-0.8 dB | `--epochs 150-200` en 2-3 sesiones con `--resume` |
+| LR efectivo 1.5e-4 (2 GPUs) vs 3e-4 (4 GPUs) con batch total 32 vs 64 | ~0.2 dB | `--no_lr_scale` (LR 3e-4 con batch 32 es estable en RIFE) |
+| UNet c=16 vs implementación oficial (c=32 aprox.) | ~0.1-0.2 dB | `--refine_c 32` |
+| Sin fine-tuning final a LR bajo con crops mayores | ~0.1 dB | última sesión con `--crop_size 256` |
+
+Plan sugerido para el run 2 (≈30 h, 3 sesiones): `--epochs 180 --no_lr_scale --refine_c 32
+--time_limit 11.2`, reanudando entre sesiones.  Objetivo: **≥ 35.0 dB**.
 
 ---
 
@@ -303,8 +338,9 @@ en 2-4 sesiones** es un objetivo realista que debería darte 34-35 dB.
 - [x] train.py: DDP, AMP, warmup+coseno, checkpoint atómico, resume exacto, time limit
 - [x] evaluate.py con visualización por bloque; inference.py con tiling y ×2^k
 - [x] Guía Kaggle + notebook
-- [ ] Verificar cifras del smoke test y velocidad en la 3060 con Vimeo90K real
-- [ ] Primer entrenamiento en Kaggle (10 épocas) y publicar curva PSNR/época
+- [x] Run 1 en Kaggle: 60 épocas / 1 sesión → **34.33 dB / 0.957** (curva en `docs/results/`)
+- [ ] Run 2: 180 épocas, `--no_lr_scale --refine_c 32`, 3 sesiones con `--resume` → objetivo ≥ 35.0 dB
+- [ ] Verificar velocidad de inferencia en la 3060 (720p/1080p) con `inference.pth`
 - [ ] **RIFE-m**: timestep t arbitrario como canal de entrada → ×4/×8 sin recursión
 - [ ] Evaluación en UCF101 / Middlebury / SNU-FILM (bancos estándar de VFI)
 - [ ] Export a ONNX / TensorRT para inferencia en tiempo real
