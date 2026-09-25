@@ -1,0 +1,59 @@
+# Fuentes sugeridas para demo_video.py  —  formato: <url_o_ruta> [start hh:mm:ss] [duration s]
+#
+# Cada tipo de vídeo estresa un aspecto distinto del modelo.  Sustituye las URLs
+# por vídeos concretos que tengas derecho a usar (tus propios vídeos, Creative
+# Commons, o clips cortos para evaluación personal).  Buscar en YouTube con los
+# términos indicados + "Creative Commons" (filtro: Funciones → Creative Commons).
+#
+# ---- 1. Casos fáciles (el modelo debería brillar: >35 dB en drop-frame) ----
+# Vídeo de naturaleza / dron a 24-30 fps, movimiento de cámara suave y continuo.
+#   buscar: "drone footage 4k nature creative commons"
+# https://www.youtube.com/watch?v=XXXXXXXXXXX 00:00:30 8
+#
+# Paseo urbano estable (walking tour): movimiento de traslación, mucha textura.
+#   buscar: "walking tour 30fps"
+# https://www.youtube.com/watch?v=XXXXXXXXXXX 00:02:00 8
+#
+# ---- 2. Movimiento grande (estresa el bloque 0 y las escalas) ----
+# Deportes: fútbol, tenis, F1 onboard.  Objetos pequeños y rápidos, panning brusco.
+#   buscar: "f1 onboard lap", "tennis rally slow motion"
+# https://www.youtube.com/watch?v=XXXXXXXXXXX 00:00:10 8
+#   → probar también con --scales 8 4 2 y comparar el PSNR p5.
+#
+# ---- 3. Oclusiones y transparencias (estresa la máscara y el UNet) ----
+# Personas pasando delante de otras, verjas, lluvia, humo, reflejos en cristal.
+#   buscar: "crowd walking street", "rain window"
+# https://www.youtube.com/watch?v=XXXXXXXXXXX 00:00:05 8
+#
+# ---- 4. Animación 2D (fuera de dominio: el modelo NO ha visto anime) ----
+# Anime/cartoon a 24 fps con "3s" (un dibujo cada 3 frames): el movimiento es a
+# saltos y el flujo tiene que ser casi cero en frames duplicados.  Espera
+# artefactos: es el caso en que Practical-RIFE 4.x entrena modelos específicos.
+#   buscar: "anime opening creative commons", vídeos de Blender Foundation (CC-BY):
+#   "Big Buck Bunny", "Sintel", "Spring" (Blender Studio) — son CC y perfectos.
+# https://www.youtube.com/watch?v=XXXXXXXXXXX 00:01:00 8
+#
+# ---- 5. GAMEPLAY (el dominio objetivo si quieres un Lossless Scaling propio) ----
+# Grabación a 60 fps de un juego con HUD.  El drop-frame test aquí es MUY
+# informativo: te dice si el crosshair/minimapa/texto tiemblan (ghosting de UI).
+#   - shooter 1ª persona (movimiento de cámara erratico + HUD fijo)  buscar: "60fps gameplay no commentary"
+#   - juego 2D / pixel-art (scroll perfecto, bordes duros)          buscar: "pixel art platformer gameplay 60fps"
+#   - carreras (movimiento radial, motion blur del propio juego)
+# https://www.youtube.com/watch?v=XXXXXXXXXXX 00:03:00 8
+# https://www.youtube.com/watch?v=XXXXXXXXXXX 00:01:00 8
+#   → Lo ideal: graba TÚ tu propio gameplay con OBS a 60 fps sin compresión
+#     (CQP 15) y úsalo como fuente local.  Servirá además como dataset de fine-tune.
+#
+# ---- 6. Contenido con texto / créditos (peor caso para ghosting) ----
+# Créditos en scroll, subtítulos, tickers de noticias.
+# https://www.youtube.com/watch?v=XXXXXXXXXXX 00:00:00 8
+#
+# ---- 7. Vídeo con cortes de escena (prueba del detector de cortes) ----
+# Un trailer de cine: cortes cada 1-2 s.  Comprueba en el log "cortes de escena
+# detectados" y que sidebyside.mp4 no muestre "morphs" entre planos.
+# https://www.youtube.com/watch?v=XXXXXXXXXXX 00:00:20 15
+#
+# ---- 8. Cámara lenta real como referencia (opcional) ----
+# Vídeo grabado a 120/240 fps y publicado a 60 fps: bájalo a 30 con ffmpeg
+# (ffmpeg -i in.mp4 -vf "select='not(mod(n,2))',setpts=N/30/TB" -r 30 in30.mp4),
+# interpola ×2 y compara frame a frame con el de 60 original: ES ground-truth real.
