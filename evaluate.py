@@ -54,6 +54,10 @@ def parse_args():
     p.add_argument("--n_vis", type=int, default=8)
     p.add_argument("--baseline_only", action="store_true")
     p.add_argument("--out_json", type=str, default=None)
+    p.add_argument(
+        "--multi_t", action="store_true",
+        help="(septuplet + RIFE-m) evaluar ×6: im1→im7 prediciendo im2..im6 con t=k/6; PSNR por t",
+    )
     args = p.parse_args()
     if not args.synthetic and not args.data_root:
         p.error("indica --data_root o --synthetic")
@@ -82,10 +86,67 @@ def visualize_block_flows(model, img0, img1, gt, out_path: Path, scales) -> None
     cv2.imwrite(str(out_path), cv2.cvtColor(np.concatenate(rows, axis=0), cv2.COLOR_RGB2BGR))
 
 
+@torch.no_grad()
+def eval_multi_t(model, ds: Vimeo90KTriplet, device, amp: bool, scales, batch_size: int) -> dict:
+    """Evaluación multi-frame (×6) sobre septuplet: I0=im1, I1=im7, GT=im2..im6
+    con t = 1/6..5/6.  Devuelve PSNR/SSIM por t y la media.
+
+    Sirve para comprobar que RIFE-m realmente usa el canal t: un RIFE
+    convertido sin fine-tune dará el mismo frame (t=0.5) para todos los t y
+    su PSNR se hundirá en t=1/6 y 5/6.  También es la métrica de las
+    tablas "×6 / multi-frame" de la literatura (gap de 6 frames = movimiento
+    3× mayor que en el triplet, así que los números son más bajos).
+    """
+    if ds.n_frames != 7:
+        raise SystemExit("--multi_t requiere el dataset septuplet")
+    ts = [k / 6 for k in range(1, 6)]
+    sums = {k: [0.0, 0.0] for k in range(1, 6)}
+    sum_base = 0.0
+    n = 0
+    names = ds.samples
+    for b in range(0, len(names), batch_size):
+        idxs = range(b, min(len(names), b + batch_size))
+        frames = [[_to_tensor(ds._load(i, 1, k, 7)[1]) for k in range(1, 8)] for i in idxs]
+        stack = torch.stack([torch.stack(f) for f in frames]).to(device)  # (B,7,3,H,W)
+        img0, img1 = stack[:, 0], stack[:, 6]
+        for k, t in zip(range(1, 6), ts):
+            gt = stack[:, k]
+            with torch.autocast("cuda", dtype=torch.float16, enabled=amp):
+                pred = model.inference(img0, img1, scales=tuple(scales), timestep=t).float()
+            sums[k][0] += psnr(pred, gt).sum().item()
+            sums[k][1] += ssim(pred, gt).sum().item()
+        sum_base += psnr((img0 + img1) / 2, stack[:, 3]).sum().item()
+        n += img0.shape[0]
+    per_t = {f"t={k}/6": {"psnr": sums[k][0] / n, "ssim": sums[k][1] / n} for k in range(1, 6)}
+    mean_psnr = sum(v["psnr"] for v in per_t.values()) / 5
+    return {"n": n, "per_t": per_t, "mean_psnr": mean_psnr, "baseline_avg_psnr_t05": sum_base / n}
+
+
+def _to_tensor(img_rgb) -> torch.Tensor:
+    return torch.from_numpy(img_rgb.copy()).permute(2, 0, 1).float() / 255.0
+
+
 def main():
     args = parse_args()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     amp = args.amp and device.type == "cuda"
+
+    if args.multi_t:
+        ds = Vimeo90KTriplet(args.data_root, split="test", crop_size=None, augment=False, max_samples=args.max_samples)
+        model = load_model(args.ckpt, device)
+        if not model.arbitrary_time:
+            print("[eval] AVISO: el checkpoint es RIFE clásico; se evaluará con t=0.5 fijo (los extremos saldrán mal).")
+        res = eval_multi_t(model, ds, device, amp, args.scales, args.batch_size)
+        print("=" * 64)
+        print(f"[eval ×6] {res['n']} septuplets  (baseline promedio en t=0.5: {res['baseline_avg_psnr_t05']:.2f} dB)")
+        for k, v in res["per_t"].items():
+            print(f"  {k}: PSNR {v['psnr']:.2f} dB  SSIM {v['ssim']:.4f}")
+        print(f"  media : PSNR {res['mean_psnr']:.2f} dB")
+        if args.out_json:
+            with open(args.out_json, "w") as f:
+                json.dump({**res, "ckpt": args.ckpt}, f, indent=2)
+            print(f"Guardado {args.out_json}")
+        return
 
     if args.synthetic:
         ds = SyntheticTripletDataset(n=args.max_samples or 200, size=224, seed=1)
