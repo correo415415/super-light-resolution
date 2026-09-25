@@ -26,12 +26,14 @@ Este archivo contiene:
   - `RIFE.inference`: forward limpio (sin teacher, sin gt) con padding
     automático para que H, W sean múltiplos de 32.
 
-Nota sobre t ≠ 0.5
-------------------
-Esta versión (RIFE v1 / paper ECCV) sólo interpola el punto medio t=0.5.
-Para tiempos arbitrarios, RIFE-m añade el timestep como canal de entrada.
-Interpolar ×2 (30→60fps) sólo necesita t=0.5; para ×4 se aplica dos veces
-de forma recursiva (ver inference.py).
+Nota sobre t ≠ 0.5 (RIFE vs RIFE-m)
+-----------------------------------
+Con `arbitrary_time=False` (RIFE, paper ECCV) sólo se interpola t=0.5 y ×4
+se hace por recursión.  Con `arbitrary_time=True` (RIFE-m) el modelo recibe t
+como canal extra y genera cualquier instante: permite ×3, 24→60 fps o cámara
+lenta continua eligiendo cada t libremente.  Matiz importante: en t=0.5 un
+RIFE puro suele ser ligeramente mejor (toda su capacidad va a un instante);
+la ganancia de RIFE-m está en los t no centrales, no en el central.
 """
 
 from __future__ import annotations
@@ -54,9 +56,11 @@ class RIFE(nn.Module):
         distill_margin: float = 0.01,
         lap_levels: int = 5,
         use_checkpoint: bool = False,
+        arbitrary_time: bool = False,
     ):
         super().__init__()
-        self.ifnet = IFNet(ifnet_widths, use_checkpoint=use_checkpoint)
+        self.arbitrary_time = arbitrary_time
+        self.ifnet = IFNet(ifnet_widths, use_checkpoint=use_checkpoint, arbitrary_time=arbitrary_time)
         self.contextnet = Contextnet(refine_c)
         self.unet = RefineUNet(refine_c)
         self.lap = LapLoss(lap_levels)
@@ -114,8 +118,10 @@ class RIFE(nn.Module):
         img1: torch.Tensor,
         gt: torch.Tensor,
         scales: tuple[float, float, float] = (4.0, 2.0, 1.0),
+        timestep=0.5,
     ) -> dict:
-        """Forward de entrenamiento.
+        """Forward de entrenamiento.  `timestep`: float o tensor (B,) con el t
+        de cada muestra (sólo relevante en RIFE-m).
 
         Espera imágenes ya con H, W múltiplos de 32 (los crops de 224×224 lo
         cumplen: 224 = 7·32).
@@ -126,7 +132,7 @@ class RIFE(nn.Module):
             merged_teacher, flows, flow_teacher, masks, mask_teacher
             loss, loss_rec, loss_rec_teacher, loss_distill
         """
-        out = self.ifnet(img0, img1, gt=gt, scales=scales)
+        out = self.ifnet(img0, img1, gt=gt, scales=scales, timestep=timestep)
         flow = out["flows"][-1]
         mask = out["masks"][-1]
         warped0, warped1 = out["warped"]
@@ -165,8 +171,9 @@ class RIFE(nn.Module):
         img1: torch.Tensor,
         scales: tuple[float, float, float] = (4.0, 2.0, 1.0),
         return_aux: bool = False,
+        timestep: float = 0.5,
     ):
-        """Interpola el frame intermedio (t=0.5) entre img0 e img1.
+        """Interpola el frame en el instante `timestep` entre img0 e img1.
 
         Args:
             img0, img1: (B,3,H,W) en [0,1], cualquier H, W.
@@ -174,13 +181,17 @@ class RIFE(nn.Module):
                         vídeo 4K, (8,4,2) suele funcionar mejor.
             return_aux: si True devuelve también flujo, máscara y fusión sin
                         refinar (para visualización/debugging).
+            timestep:   t ∈ (0,1).  Sólo tiene efecto en RIFE-m; en RIFE
+                        clásico sólo se admite 0.5.
         """
+        if not self.arbitrary_time and abs(float(timestep) - 0.5) > 1e-6:
+            raise ValueError("este checkpoint es RIFE (t fijo = 0.5); para t arbitrario usa un modelo RIFE-m")
         _, _, h, w = img0.shape
         multiple = int(32 * max(scales) / 4)  # 32 para (4,2,1); 64 para (8,4,2)
         img0_p, pad = self.pad_to_multiple(img0, multiple)
         img1_p, _ = self.pad_to_multiple(img1, multiple)
 
-        out = self.ifnet(img0_p, img1_p, gt=None, scales=scales)
+        out = self.ifnet(img0_p, img1_p, gt=None, scales=scales, timestep=timestep)
         flow = out["flows"][-1]
         mask = out["masks"][-1]
         warped0, warped1 = out["warped"]
@@ -209,3 +220,41 @@ class RIFE(nn.Module):
     def export_inference_state_dict(self) -> dict:
         """state_dict sin el teacher, para checkpoints de despliegue."""
         return {k: v for k, v in self.state_dict().items() if not k.startswith("ifnet.teacher")}
+
+    def load_state_dict_compat(self, state: dict) -> dict:
+        """Carga un checkpoint aunque cambie el número de canales de entrada de
+        los IFBlocks (RIFE → RIFE-m) o falte el teacher (inference.pth).
+
+        Para la primera conv de cada IFBlock (`encoder.0.0.weight`, forma
+        (C_out, C_in, 3, 3)):
+          - C_in igual → copia directa;
+          - el checkpoint tiene C_in-1 (RIFE → RIFE-m) → se copian los canales
+            existentes y el canal t se inserta con peso CERO en su posición
+            (índice 6, justo después de I_0, I_1).  Con peso cero el modelo
+            convertido es numéricamente idéntico al original para cualquier t;
+            el fine-tune sólo tiene que aprender a USAR t.
+        Devuelve {copied, adapted, skipped} para el log.
+        """
+        own = self.state_dict()
+        new_state, adapted, skipped = {}, [], []
+        for k, v_own in own.items():
+            if k not in state:
+                skipped.append(k)
+                continue
+            v = state[k]
+            if v.shape == v_own.shape:
+                new_state[k] = v
+            elif (
+                k.endswith("encoder.0.0.weight") and v.dim() == 4
+                and v.shape[0] == v_own.shape[0] and v.shape[2:] == v_own.shape[2:]
+                and v_own.shape[1] == v.shape[1] + 1
+            ):
+                w = torch.zeros_like(v_own)
+                w[:, :6] = v[:, :6]   # I_0, I_1
+                w[:, 7:] = v[:, 6:]   # warps, máscara, flujo, gt: desplazados 1
+                new_state[k] = w      # canal 6 (t) queda a cero
+                adapted.append(k)
+            else:
+                skipped.append(k)
+        self.load_state_dict(new_state, strict=False)
+        return {"copied": len(new_state) - len(adapted), "adapted": adapted, "skipped": skipped}
