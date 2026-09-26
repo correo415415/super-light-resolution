@@ -183,6 +183,8 @@ usarlo en tu 3060 con `inference.py`.
 | `CUDA out of memory` | `--grad_checkpoint`, `--batch_size 12`, o `--refine_c 8`. |
 | La sesión murió y no hay output | No usaste `--time_limit`, o el margen era pequeño.  Usa 11.0 para ir seguro. |
 | Loss NaN | Revisa `--weight_decay 1e-3` (AdamW).  Si persiste, `--lr 2e-4` y `--grad_clip 0.5`. |
+| `FileNotFoundError: .../sequences/00023/0424/im1.png` o `libpng error: IDAT: CRC error` en un worker del DataLoader | El mirror tiene ficheros faltantes/corruptos (el de `maiimaii` al menos uno).  Desde el commit "tolerar PNGs corruptos", `dataset.py` sustituye la muestra y avisa en vez de abortar.  Mide cuántos hay con `python scripts/check_dataset.py --data_root "$DATA" --max_seqs 3000`; si son muchos, `--write_clean_lists /kaggle/working/lists` y entrena con `--list_dir /kaggle/working/lists`. |
+| La celda 1 tarda 40 minutos | `glob('/kaggle/input/**/…', recursive=True)` recorre los 640k ficheros del dataset por el disco de red.  El notebook actual usa una búsqueda acotada por profundidad (segundos). |
 
 ---
 
