@@ -106,6 +106,7 @@ def parse_args() -> argparse.Namespace:
         help="scale augmentation: con prob. P reescalar por s~U(SMIN,SMAX) antes del recorte",
     )
     p.add_argument("--max_gap", type=int, default=6, help="septuplet: separación máxima i1-i0 (1..6)")
+    p.add_argument("--list_dir", type=str, default=None, help="carpeta con listas train/test alternativas (p.ej. limpias)")
     # Optimización
     p.add_argument("--epochs", type=int, default=300)
     p.add_argument("--batch_size", type=int, default=16, help="por GPU")

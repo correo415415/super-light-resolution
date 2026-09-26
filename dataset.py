@@ -44,6 +44,7 @@ de pasos).  Si no lo hace, hay bug.
 from __future__ import annotations
 
 import random
+import warnings
 from pathlib import Path
 
 import cv2
@@ -97,6 +98,7 @@ class Vimeo90KTriplet(Dataset):
         arbitrary_time: bool = False,
         scale_aug: tuple[float, float, float] = (0.0, 1.0, 1.0),
         max_gap: int = 6,
+        list_dir: str | Path | None = None,
     ):
         """
         Args:
@@ -135,7 +137,10 @@ class Vimeo90KTriplet(Dataset):
                 f"No encuentro tri_trainlist.txt ni sep_trainlist.txt en {self.root}.  "
                 "¿Apunta --data_root a la carpeta 'vimeo_triplet' / 'vimeo_septuplet'?"
             )
-        list_file = self.root / f"{prefix}_{'trainlist' if split == 'train' else 'testlist'}.txt"
+        # list_dir: carpeta alternativa con las listas (p.ej. listas "limpias" de
+        # scripts/check_dataset.py cuando el dataset está en un disco de sólo lectura).
+        list_root = Path(list_dir) if list_dir else self.root
+        list_file = list_root / f"{prefix}_{'trainlist' if split == 'train' else 'testlist'}.txt"
         with open(list_file) as f:
             self.samples = [line.strip() for line in f if line.strip()]
         if max_samples is not None:
@@ -199,9 +204,36 @@ class Vimeo90KTriplet(Dataset):
             t = 1.0 - t
         return img0, gt, img1, t
 
+    # Los mirrors públicos de Vimeo90K a veces traen PNGs truncados o secuencias
+    # incompletas (p.ej. `libpng error: IDAT: CRC error` + FileNotFoundError en
+    # 00023/0424 del mirror septuplet de Kaggle).  Un solo fichero malo NO
+    # debe tirar un entrenamiento de 11 h: en train sustituimos la muestra por
+    # otra aleatoria (y avisamos), en test la saltamos de forma determinista.
+    MAX_RETRIES = 8
+
+    def _load_safe(self, idx: int, i0: int, it: int, i1: int):
+        try:
+            imgs = self._load(idx, i0, it, i1)
+        except (FileNotFoundError, cv2.error) as e:
+            return None, e
+        if any(im is None or im.shape[:2] != imgs[0].shape[:2] for im in imgs):
+            return None, ValueError("frame vacío o tamaños distintos")
+        return imgs, None
+
     def __getitem__(self, idx: int) -> dict:
         i0, it, i1, t = self._pick_indices()
-        img0, gt, img1 = self._load(idx, i0, it, i1)
+        imgs, err = self._load_safe(idx, i0, it, i1)
+        tries = 0
+        while imgs is None and tries < self.MAX_RETRIES:
+            warnings.warn(f"[dataset] muestra {self.samples[idx]} ilegible ({err}); se sustituye")
+            tries += 1
+            # train: otra aleatoria; test: la siguiente (determinista, reproducible)
+            idx = random.randrange(len(self.samples)) if self.augment else (idx + 1) % len(self.samples)
+            i0, it, i1, t = self._pick_indices()
+            imgs, err = self._load_safe(idx, i0, it, i1)
+        if imgs is None:
+            raise RuntimeError(f"{self.MAX_RETRIES} muestras ilegibles seguidas; ¿data_root correcto?  último error: {err}")
+        img0, gt, img1 = imgs
         if self.augment:
             img0, gt, img1, t = self._augment(img0, gt, img1, t)
         elif self.crop_size is not None:
@@ -289,4 +321,5 @@ def build_dataset(args, split: str) -> Dataset:
         arbitrary_time=getattr(args, "arbitrary_time", False),
         scale_aug=tuple(getattr(args, "scale_aug", (0.0, 1.0, 1.0))),
         max_gap=getattr(args, "max_gap", 6),
+        list_dir=getattr(args, "list_dir", None),
     )
