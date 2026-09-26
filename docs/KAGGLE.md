@@ -213,7 +213,10 @@ y comprueba que contengan `sep_trainlist.txt`, `sep_testlist.txt` y `sequences/*
 | `maiimaii/vimeo-septuplet` (título "dataset_mai") | 87.9 GB, 642k ficheros | Carpeta `vimeo_septuplet/` — tamaño compatible con el dataset completo (91 701 secuencias) |
 | `wangsally/vimeo-90k-7` | ? | Otro mirror del septuplet |
 
-El notebook localiza la raíz con `glob('/kaggle/input/**/sep_trainlist.txt')`.  Ojo: 88 GB en
+El notebook localiza la raíz con `glob('/kaggle/input/**/sep_trainlist.txt')`.  En el mirror de
+`maiimaii` la ruta real es `/kaggle/input/datasets/maiimaii/vimeo-septuplet/vimeo_septuplet (1)/vimeo_septuplet`
+— **con un espacio y paréntesis** — por eso en las celdas shell `DATA_ROOT` va siempre entre comillas
+(`--data_root "{DATA_ROOT}"`); sin ellas `torchrun` recibe la ruta partida en dos argumentos.  Ojo: 88 GB en
 `/kaggle/input` (disco de red) → la primera época puede ir más lenta por la caché; `--num_workers 4`
 y batch 16 por GPU fueron suficientes en el run 1 (10 min/época sobre 51k tríos).  El septuplet
 tiene 64 612 secuencias de train → **≈13–15 min/época**, ≈45 épocas por sesión de 11.2 h.
@@ -228,7 +231,18 @@ sesión 2: --resume checkpoints_run2/last.pth (mismo --epochs 90)  → completa 
           si vas a hacerlo, decide el total ANTES de la sesión 1.)
 ```
 
-El notebook `docs/kaggle_notebook.ipynb` ya está configurado así (celda 1: `INIT_FROM`/`RESUME`).
+El notebook `docs/kaggle_notebook.ipynb` ya está configurado así.  La celda 1 **detecta sola** el modo:
+
+* Si entre los inputs hay `**/checkpoints_run2/last.pth` (versión anterior de este notebook) → reanuda.
+* Si no, busca `**/checkpoints/best.pth` (output del notebook del run 1) → fine-tune.
+* Si no encuentra nada, lista los `.pth` visibles y para con un mensaje claro.
+
+Los outputs de un notebook añadido como input se montan en
+`/kaggle/input/notebooks/<usuario>/<slug-del-notebook>/<lo que había en /kaggle/working>`; el run 1
+escribió en `/kaggle/working/checkpoints/`, así que su `best.pth` está un nivel por debajo del slug
+(por eso el glob es recursivo `**`).  Comprueba en la salida de la celda 1 ("Inputs montados") que
+aparecen tanto el dataset como el notebook del run 1; si falta el segundo: *Add Input → Your Work →
+Notebooks → versión del run 1*.
 
 ### 9.3 Qué mirar en los resultados
 
