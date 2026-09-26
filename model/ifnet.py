@@ -158,28 +158,57 @@ class IFBlock(nn.Module):
 class IFNet(nn.Module):
     """Cascada de 3 IFBlocks (estudiante) + 1 IFBlock teacher opcional.
 
-    Canales de entrada:
+    Canales de entrada (RIFE, t fijo = 0.5):
         bloque0:   I_0, I_1                                        → 3+3      = 6
         bloque1/2: I_0, I_1, warp(I_0), warp(I_1), M, flujo previo → 6+6+1+4  = 17
         teacher:   lo mismo + I_t (gt)                             → 17+3     = 20
+
+    RIFE-m (`arbitrary_time=True`): tiempo arbitrario t ∈ (0, 1)
+    ---------------------------------------------------------------
+    Se añade UN canal extra a la entrada de cada bloque: un mapa constante
+    con el valor t.  Con eso la red sabe "a qué distancia" de I_0 e I_1 está
+    el frame que debe generar y puede escalar el flujo en consecuencia
+    (F_{t→0} ≈ -t·F_{0→1}, F_{t→1} ≈ (1-t)·F_{0→1} para movimiento lineal).
+    Es lo mismo que hace el IFNet_m oficial (7 / 18 / 18 / 21 canales).
+
+    Compatibilidad con checkpoints RIFE (t=0.5): los pesos del canal t se
+    inicializan a CERO, así que un modelo RIFE-m convertido produce
+    exactamente lo mismo que el RIFE original para cualquier t.  Fine-tunear
+    desde el run 1 aprende el uso de t en pocas épocas en vez de re-aprender
+    todo desde cero.  Ver `RIFE.load_state_dict_compat`.
     """
 
     def __init__(
         self,
         widths: tuple[int, int, int] = (240, 150, 90),
         use_checkpoint: bool = False,
+        arbitrary_time: bool = False,
     ):
         super().__init__()
+        self.arbitrary_time = arbitrary_time
+        extra = 1 if arbitrary_time else 0
         c0, c1, c2 = widths
         self.blocks = nn.ModuleList(
             [
-                IFBlock(6, c0, use_checkpoint),
-                IFBlock(17, c1, use_checkpoint),
-                IFBlock(17, c2, use_checkpoint),
+                IFBlock(6 + extra, c0, use_checkpoint),
+                IFBlock(17 + extra, c1, use_checkpoint),
+                IFBlock(17 + extra, c2, use_checkpoint),
             ]
         )
         # Teacher: idéntico en forma al bloque2 pero con 3 canales extra (I_t).
-        self.teacher = IFBlock(20, c2, use_checkpoint)
+        self.teacher = IFBlock(20 + extra, c2, use_checkpoint)
+
+    def _time_map(self, img0: torch.Tensor, timestep) -> torch.Tensor | None:
+        """Mapa constante (B, 1, H, W) con el valor t (None si RIFE clásico).
+        `timestep`: float (mismo t para el batch) o tensor (B,) con un t por
+        muestra (necesario en entrenamiento RIFE-m)."""
+        if not self.arbitrary_time:
+            return None
+        B, _, H, W = img0.shape
+        if not torch.is_tensor(timestep):
+            timestep = torch.tensor(float(timestep), device=img0.device, dtype=img0.dtype)
+        timestep = timestep.to(img0.device, img0.dtype).reshape(-1, 1, 1, 1)
+        return timestep.expand(B, 1, H, W)
 
     # ------------------------------------------------------------------
     @staticmethod
@@ -198,6 +227,7 @@ class IFNet(nn.Module):
         img1: torch.Tensor,
         gt: torch.Tensor | None = None,
         scales: tuple[float, float, float] = (4.0, 2.0, 1.0),
+        timestep=0.5,
     ) -> dict:
         """
         Args:
@@ -208,6 +238,8 @@ class IFNet(nn.Module):
                         estamos en modo train), se ejecuta el teacher.
             scales:     escalas de los 3 bloques.  Para vídeo 4K se puede usar
                         (8, 4, 2) y así los bloques ven movimientos mayores.
+            timestep:   t del frame a generar (float o tensor (B,)).  Sólo se
+                        usa si `arbitrary_time=True`; RIFE clásico lo ignora.
 
         Returns dict con:
             flows:   lista de 3 tensores (B, 4, H, W), flujo acumulado tras cada bloque.
@@ -219,15 +251,17 @@ class IFNet(nn.Module):
         flows, mask_logits, merged = [], [], []
         flow = mask_logit = None
         warped0, warped1 = img0, img1  # antes de tener flujo, "warp" = identidad
+        tmap = self._time_map(img0, timestep)
+        t_in = (tmap,) if tmap is not None else ()  # canal t (sólo RIFE-m)
 
         for block, scale in zip(self.blocks, scales):
             if flow is None:
-                # Bloque 0: sólo ve las imágenes originales.
-                flow, mask_logit = block(torch.cat((img0, img1), dim=1), None, scale)
+                # Bloque 0: sólo ve las imágenes originales (+ t en RIFE-m).
+                flow, mask_logit = block(torch.cat((img0, img1, *t_in), dim=1), None, scale)
             else:
                 # Bloques 1 y 2: ven además los warps y la máscara previos y
                 # predicen un residual que se SUMA a la estimación anterior.
-                x = torch.cat((img0, img1, warped0, warped1, mask_logit), dim=1)
+                x = torch.cat((img0, img1, *t_in, warped0, warped1, mask_logit), dim=1)
                 flow_d, mask_d = block(x, flow, scale)
                 flow = flow + flow_d
                 mask_logit = mask_logit + mask_d
@@ -242,7 +276,7 @@ class IFNet(nn.Module):
 
         # ---------------- Teacher (sólo entrenamiento) ----------------
         if gt is not None:
-            x_tea = torch.cat((img0, img1, warped0, warped1, mask_logit, gt), dim=1)
+            x_tea = torch.cat((img0, img1, *t_in, warped0, warped1, mask_logit, gt), dim=1)
             flow_d, mask_d = self.teacher(x_tea, flow, scale=1.0)
             flow_tea = flow + flow_d
             mask_logit_tea = mask_logit + mask_d

@@ -150,6 +150,86 @@ def test_parameter_count_full_model():
     assert 5e6 < n_student < 20e6
 
 
+# ---------------------------------------------------------------------------
+# RIFE-m (tiempo arbitrario)
+# ---------------------------------------------------------------------------
+def test_rifem_shapes_and_timestep_tensor():
+    model = RIFE(ifnet_widths=(32, 24, 16), refine_c=8, arbitrary_time=True)
+    img0, img1, gt = (torch.rand(2, 3, 64, 64) for _ in range(3))
+    t = torch.tensor([0.25, 0.75])
+    out = model(img0, img1, gt, timestep=t)
+    assert out["pred"].shape == (2, 3, 64, 64) and torch.isfinite(out["loss"])
+    out["loss"].backward()
+    # El canal t (índice 6 de la primera conv del bloque 0) debe recibir gradiente.
+    g = model.ifnet.blocks[0].encoder[0][0].weight.grad[:, 6]
+    assert g is not None and g.abs().sum() > 0
+
+
+def test_rifem_output_depends_on_t():
+    torch.manual_seed(3)
+    model = RIFE(ifnet_widths=(32, 24, 16), refine_c=8, arbitrary_time=True).eval()
+    img0, img1 = torch.rand(1, 3, 64, 64), torch.rand(1, 3, 64, 64)
+    a = model.inference(img0, img1, timestep=0.2)
+    b = model.inference(img0, img1, timestep=0.8)
+    assert not torch.allclose(a, b), "con pesos aleatorios distintos t deben dar salidas distintas"
+
+
+def test_rife_classic_rejects_arbitrary_t():
+    model = RIFE(ifnet_widths=(32, 24, 16), refine_c=8).eval()
+    img0, img1 = torch.rand(1, 3, 64, 64), torch.rand(1, 3, 64, 64)
+    try:
+        model.inference(img0, img1, timestep=0.3)
+        assert False, "debería fallar"
+    except ValueError:
+        pass
+
+
+def test_convert_rife_to_rifem_is_identity():
+    """Un RIFE convertido a RIFE-m (canal t con peso 0) debe dar EXACTAMENTE
+    la misma salida que el RIFE original, para cualquier t."""
+    torch.manual_seed(4)
+    rife = RIFE(ifnet_widths=(32, 24, 16), refine_c=8).eval()
+    rifem = RIFE(ifnet_widths=(32, 24, 16), refine_c=8, arbitrary_time=True).eval()
+    info = rifem.load_state_dict_compat(rife.state_dict())
+    assert len(info["adapted"]) == 4, info  # 3 bloques + teacher
+    assert not info["skipped"], info["skipped"]
+    img0, img1 = torch.rand(1, 3, 64, 64), torch.rand(1, 3, 64, 64)
+    ref = rife.inference(img0, img1)
+    for t in (0.1, 0.5, 0.9):
+        assert torch.allclose(rifem.inference(img0, img1, timestep=t), ref, atol=1e-6), t
+    # También desde un checkpoint de inferencia (sin teacher): el teacher se salta.
+    info2 = RIFE(ifnet_widths=(32, 24, 16), refine_c=8, arbitrary_time=True).load_state_dict_compat(
+        rife.export_inference_state_dict())
+    assert all(k.startswith("ifnet.teacher") for k in info2["skipped"])
+
+
+def test_ema_swap_and_export():
+    """EMA: update sigue la fórmula; apply_to intercambia pesos y los restaura;
+    un export dentro del `with` NO debe quedar aliasado a los pesos vivos."""
+    from train import EMA
+
+    torch.manual_seed(5)
+    m = RIFE(ifnet_widths=(16, 12, 8), refine_c=4)
+    ema = EMA(m, 0.9)
+    k = "ifnet.blocks.0.encoder.0.0.weight"
+    w0 = m.state_dict()[k].clone()
+    with torch.no_grad():
+        for p in m.parameters():
+            p.add_(1.0)
+    ema.update(m)
+    assert torch.allclose(ema.shadow[k], 0.9 * w0 + 0.1 * (w0 + 1.0), atol=1e-6)
+    live = m.state_dict()[k].clone()
+    with ema.apply_to(m) as raw:
+        assert torch.allclose(raw.state_dict()[k], ema.shadow[k])
+        exported = {kk: v.detach().clone() for kk, v in raw.export_inference_state_dict().items()}
+    assert torch.allclose(m.state_dict()[k], live), "los pesos no se restauraron"
+    assert torch.allclose(exported[k], ema.shadow[k]), "el export debe llevar pesos EMA"
+    # round-trip de estado
+    ema2 = EMA(m, 0.5)
+    ema2.load_state_dict(ema.state_dict())
+    assert ema2.decay == 0.9 and torch.allclose(ema2.shadow[k], ema.shadow[k])
+
+
 if __name__ == "__main__":
     import inspect
 

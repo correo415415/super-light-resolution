@@ -7,13 +7,19 @@ Uso:
     python inference.py --ckpt ... --input in.mp4 --output out.mp4 --exp 2                    # ×4
     python inference.py --ckpt ... --input in.mp4 --output out.mp4 --tile 512 --tile_overlap 64  # vídeo 4K
     python inference.py --ckpt ... --img0 a.png --img1 b.png --output mid.png                 # 2 imágenes
+    python inference.py --ckpt rifem.pth --input in.mp4 --output out.mp4 --multi 3            # ×3 (RIFE-m)
 
 Cómo funciona ×2^k
 ------------------
-El modelo sólo interpola t=0.5.  Para ×4 hacemos recursión: entre (A, B)
+RIFE clásico sólo interpola t=0.5.  Para ×4 hacemos recursión: entre (A, B)
 generamos M, y luego entre (A, M) y (M, B).  Con `--exp k` obtenemos 2^k−1
-frames intermedios.  Cada nivel de recursión acumula un poco de error, así
-que para ×8 o más, RIFE-m (con timestep arbitrario) sería preferible.
+frames intermedios.  Cada nivel de recursión acumula un poco de error.
+
+RIFE-m (`--arbitrary_time` en train.py) acepta cualquier t: con `--multi N`
+se predicen los N−1 frames DIRECTAMENTE desde (A, B) con t = k/N.  Permite
+factores no potencia de 2 (×3, ×5: 24→72 fps, 24→120 fps) y no acumula
+error.  El modelo se detecta automáticamente desde el checkpoint; con un
+RIFE clásico `--multi` sólo admite potencias de 2 (cae en la recursión).
 
 Tiling
 ------
@@ -56,7 +62,8 @@ def parse_args():
     p.add_argument("--img0", type=str, help="(modo imágenes) primer frame")
     p.add_argument("--img1", type=str, help="(modo imágenes) segundo frame")
     p.add_argument("--output", required=True)
-    p.add_argument("--exp", type=int, default=1, help="factor 2^exp (1 → ×2)")
+    p.add_argument("--exp", type=int, default=1, help="factor 2^exp (1 → ×2); recursivo")
+    p.add_argument("--multi", type=int, default=None, help="factor ×N directo (RIFE-m, cualquier N); tiene prioridad sobre --exp")
     p.add_argument("--scales", type=float, nargs=3, default=(4, 2, 1))
     p.add_argument("--tile", type=int, default=0, help="tamaño de tile (0 = sin tiling)")
     p.add_argument("--tile_overlap", type=int, default=64)
@@ -74,19 +81,24 @@ class Interpolator:
     def __init__(self, model, scales, tile: int, overlap: int, fp16: bool, device):
         self.model, self.scales, self.tile, self.overlap, self.fp16, self.device = model, tuple(scales), tile, overlap, fp16, device
 
+    @property
+    def arbitrary_time(self) -> bool:
+        return bool(getattr(self.model, "arbitrary_time", False))
+
     @torch.no_grad()
-    def _run(self, img0: torch.Tensor, img1: torch.Tensor) -> torch.Tensor:
+    def _run(self, img0: torch.Tensor, img1: torch.Tensor, t: float = 0.5) -> torch.Tensor:
         with torch.autocast("cuda", dtype=torch.float16, enabled=self.fp16 and self.device.type == "cuda"):
-            return self.model.inference(img0, img1, scales=self.scales).float()
+            return self.model.inference(img0, img1, scales=self.scales, timestep=t).float()
 
     @torch.no_grad()
-    def middle(self, img0: torch.Tensor, img1: torch.Tensor) -> torch.Tensor:
-        """Frame en t=0.5.  (1,3,H,W) → (1,3,H,W)."""
+    def middle(self, img0: torch.Tensor, img1: torch.Tensor, t: float = 0.5) -> torch.Tensor:
+        """Frame en el instante t (0.5 por defecto; t≠0.5 sólo con RIFE-m).
+        (1,3,H,W) → (1,3,H,W)."""
         if self.tile <= 0:
-            return self._run(img0, img1)
-        return self._tiled(img0, img1)
+            return self._run(img0, img1, t)
+        return self._tiled(img0, img1, t)
 
-    def _tiled(self, img0: torch.Tensor, img1: torch.Tensor) -> torch.Tensor:
+    def _tiled(self, img0: torch.Tensor, img1: torch.Tensor, t: float = 0.5) -> torch.Tensor:
         _, _, H, W = img0.shape
         t, o = self.tile, self.overlap
         stride = t - o
@@ -110,7 +122,7 @@ class Interpolator:
             for x in xs:
                 y0, x0 = max(0, y), max(0, x)
                 y1, x1 = min(H, y0 + t), min(W, x0 + t)
-                pred = self._run(img0[:, :, y0:y1, x0:x1], img1[:, :, y0:y1, x0:x1])
+                pred = self._run(img0[:, :, y0:y1, x0:x1], img1[:, :, y0:y1, x0:x1], t)
                 wt = w2d[:, :, : y1 - y0, : x1 - x0]
                 out[:, :, y0:y1, x0:x1] += pred * wt
                 weight[:, :, y0:y1, x0:x1] += wt
@@ -125,6 +137,23 @@ class Interpolator:
         if exp == 1:
             return [mid]
         return self.between(img0, mid, exp - 1) + [mid] + self.between(mid, img1, exp - 1)
+
+    @torch.no_grad()
+    def multi(self, img0: torch.Tensor, img1: torch.Tensor, n: int) -> list[torch.Tensor]:
+        """Devuelve n−1 frames intermedios en t = 1/n, 2/n, … (factor ×n).
+
+        - RIFE-m: cada frame se predice DIRECTAMENTE desde (I0, I1) con su t
+          → sin acumulación de error, cualquier n (×3, ×5…), y todos los
+          frames tienen la misma calidad.
+        - RIFE clásico: sólo si n es potencia de 2, vía `between` recursivo.
+        """
+        if n < 2:
+            return []
+        if self.arbitrary_time:
+            return [self.middle(img0, img1, k / n) for k in range(1, n)]
+        if n & (n - 1):
+            raise ValueError(f"factor ×{n} requiere RIFE-m (arbitrary_time); RIFE clásico sólo potencias de 2")
+        return self.between(img0, img1, n.bit_length() - 1)
 
 
 # ---------------------------------------------------------------------------
@@ -143,7 +172,7 @@ def tensor_to_bgr(t: torch.Tensor) -> np.ndarray:
 def run_images(args, interp: Interpolator, device):
     img0 = bgr_to_tensor(cv2.imread(args.img0), device)
     img1 = bgr_to_tensor(cv2.imread(args.img1), device)
-    mids = interp.between(img0, img1, args.exp)
+    mids = interp.multi(img0, img1, args.factor)
     out = Path(args.output)
     if len(mids) == 1:
         cv2.imwrite(str(out), tensor_to_bgr(mids[0]))
@@ -163,7 +192,7 @@ def run_video(args, interp: Interpolator, device):
     W = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     H = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     n_total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    factor = 2**args.exp
+    factor = args.factor
     fps_out = args.fps or fps_in * factor
     Path(args.output).parent.mkdir(parents=True, exist_ok=True)
     writer = cv2.VideoWriter(args.output, cv2.VideoWriter_fourcc(*args.codec), fps_out, (W, H))
@@ -181,7 +210,7 @@ def run_video(args, interp: Interpolator, device):
         if not ok or (args.max_frames and n_in >= args.max_frames):
             break
         cur_t = bgr_to_tensor(cur, device)
-        for mid in interp.between(prev_t, cur_t, args.exp):
+        for mid in interp.multi(prev_t, cur_t, factor):
             writer.write(tensor_to_bgr(mid))
             n_out += 1
         writer.write(cur)
@@ -202,6 +231,8 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = load_model(args.ckpt, device)
     interp = Interpolator(model, args.scales, args.tile, args.tile_overlap, args.fp16, device)
+    args.factor = args.multi if args.multi else 2**args.exp
+    print(f"[inference] modelo {'RIFE-m (t arbitrario)' if interp.arbitrary_time else 'RIFE clásico (t=0.5, recursivo)'}  factor ×{args.factor}")
     if args.img0 and args.img1:
         run_images(args, interp, device)
     elif args.input:

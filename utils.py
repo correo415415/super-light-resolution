@@ -17,16 +17,21 @@ def load_model(ckpt_path: str | Path, device: torch.device, refine_c: int | None
     """Carga un checkpoint de train.py (last.pth / best.pth / inference.pth).
 
     El checkpoint guarda `args`, de donde leemos la configuración del modelo
-    para no tener que pasarla a mano.  Si el checkpoint es de inferencia (sin
-    teacher), cargamos con strict=False y el teacher queda con pesos
-    aleatorios (no se usa en inferencia).
+    (anchuras, refine_c, arbitrary_time) para no tener que pasarla a mano.
+    Si el checkpoint es de inferencia (sin teacher), cargamos con
+    strict=False y el teacher queda con pesos aleatorios (no se usa).
+    Si el checkpoint de entrenamiento lleva pesos EMA, se usan éstos (son
+    los que se validaron y suelen ser mejores que los pesos "vivos").
     """
     ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     args = ckpt.get("args", {})
     widths = tuple(args.get("ifnet_widths", (240, 150, 90)))
     rc = refine_c or args.get("refine_c", 16)
-    model = RIFE(ifnet_widths=widths, refine_c=rc)
-    missing, unexpected = model.load_state_dict(ckpt["model"], strict=False)
+    model = RIFE(ifnet_widths=widths, refine_c=rc, arbitrary_time=bool(args.get("arbitrary_time", False)))
+    state = ckpt["model"]
+    if ckpt.get("ema") is not None:
+        state = {**state, **ckpt["ema"]["shadow"]}
+    missing, unexpected = model.load_state_dict(state, strict=False)
     missing = [k for k in missing if not k.startswith("ifnet.teacher")]
     if missing or unexpected:
         raise RuntimeError(f"checkpoint incompatible.  faltan={missing[:5]} sobran={unexpected[:5]}")

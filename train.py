@@ -35,6 +35,19 @@ Decisiones de diseño
   script se detiene limpiamente antes de que Kaggle mate la sesión.
 * **Gradient clipping** (norma 1.0): red de seguridad contra picos de
   gradiente en los primeros pasos, cuando el flujo es basura.
+* **RIFE-m (`--arbitrary_time`)**: canal extra de timestep en cada IFBlock;
+  necesita el dataset septuplet (t aleatorio).  Peso de distill 0.005 por
+  defecto (RIFE clásico: 0.01), como recomienda el paper.
+* **Fine-tune (`--init_from`)**: carga SÓLO los pesos (no optimizador ni
+  step) de un checkpoint anterior, adaptando RIFE → RIFE-m si hace falta
+  (canal t inicializado a cero → el modelo arranca idéntico al original).
+  Mucho más barato que entrenar RIFE-m desde cero.
+* **EMA (`--ema 0.999`)**: media móvil exponencial de los pesos.  Se valida
+  y se exporta con los pesos EMA, que suelen dar +0.1-0.3 dB y menos ruido
+  entre épocas.  Se guarda en el checkpoint → reanudable.
+* **Scale augmentation (`--scale_aug P SMIN SMAX`)**: con prob. P se
+  reescala la muestra antes del recorte.  Consejo de hzwer (autor de RIFE)
+  para cerrar el gap train/inferencia con movimientos grandes.
 """
 
 from __future__ import annotations
@@ -77,6 +90,22 @@ def parse_args() -> argparse.Namespace:
         help="anchuras de los 3 IFBlocks (reducir sólo para depurar en CPU)",
     )
     p.add_argument("--grad_checkpoint", action="store_true", help="gradient checkpointing en IFBlocks")
+    p.add_argument("--arbitrary_time", action="store_true", help="RIFE-m: canal timestep (requiere septuplet)")
+    p.add_argument(
+        "--distill_weight", type=float, default=None,
+        help="peso de la pérdida de distilación (por defecto 0.005 si RIFE-m, 0.01 si RIFE)",
+    )
+    p.add_argument(
+        "--init_from", type=str, default=None,
+        help="fine-tune: cargar sólo pesos de este checkpoint (RIFE→RIFE-m se adapta automáticamente)",
+    )
+    p.add_argument("--ema", type=float, default=0.0, help="decay de EMA de pesos (0 = desactivado; típico 0.999)")
+    # Augmentación
+    p.add_argument(
+        "--scale_aug", type=float, nargs=3, default=(0.0, 1.0, 1.0), metavar=("P", "SMIN", "SMAX"),
+        help="scale augmentation: con prob. P reescalar por s~U(SMIN,SMAX) antes del recorte",
+    )
+    p.add_argument("--max_gap", type=int, default=6, help="septuplet: separación máxima i1-i0 (1..6)")
     # Optimización
     p.add_argument("--epochs", type=int, default=300)
     p.add_argument("--batch_size", type=int, default=16, help="por GPU")
@@ -110,6 +139,10 @@ def parse_args() -> argparse.Namespace:
         args.batch_size = min(args.batch_size, 8)
     if not args.synthetic and args.data_root is None:
         p.error("indica --data_root o usa --synthetic")
+    if args.distill_weight is None:
+        args.distill_weight = 0.005 if args.arbitrary_time else 0.01
+    if not 0.0 <= args.ema < 1.0:
+        p.error("--ema debe estar en [0, 1)")
     return args
 
 
@@ -184,14 +217,75 @@ def lr_at(step: int, total_steps: int, base_lr: float, min_lr: float, warmup: in
 
 
 # ---------------------------------------------------------------------------
+# EMA de pesos
+# ---------------------------------------------------------------------------
+class EMA:
+    """Media móvil exponencial de los parámetros: shadow = d·shadow + (1-d)·θ.
+
+    Se mantiene en fp32 en el mismo device.  `apply_to(model)` es un context
+    manager que intercambia temporalmente los pesos del modelo por los EMA
+    (para validar/exportar) y los restaura al salir.  Los buffers (no hay
+    BatchNorm en RIFE) no se promedian.
+    """
+
+    def __init__(self, model: nn.Module, decay: float):
+        raw = model.module if isinstance(model, DDP) else model
+        self.decay = decay
+        self.shadow = {k: v.detach().clone().float() for k, v in raw.state_dict().items() if v.dtype.is_floating_point}
+
+    @torch.no_grad()
+    def update(self, model: nn.Module) -> None:
+        raw = model.module if isinstance(model, DDP) else model
+        for k, v in raw.state_dict().items():
+            if k in self.shadow:
+                self.shadow[k].mul_(self.decay).add_(v.detach().float(), alpha=1.0 - self.decay)
+
+    def state_dict(self) -> dict:
+        return {"decay": self.decay, "shadow": self.shadow}
+
+    def load_state_dict(self, state: dict) -> None:
+        self.decay = state.get("decay", self.decay)
+        for k, v in state["shadow"].items():
+            if k in self.shadow:
+                self.shadow[k].copy_(v.to(self.shadow[k].device))
+
+    def ema_state_dict(self, model: nn.Module) -> dict:
+        """state_dict completo del modelo con los pesos EMA (dtype original)."""
+        raw = model.module if isinstance(model, DDP) else model
+        out = {}
+        for k, v in raw.state_dict().items():
+            out[k] = self.shadow[k].to(v.dtype) if k in self.shadow else v
+        return out
+
+    class _Swap:
+        def __init__(self, ema, model):
+            self.ema, self.model = ema, model
+
+        def __enter__(self):
+            raw = self.model.module if isinstance(self.model, DDP) else self.model
+            self.backup = {k: v.detach().clone() for k, v in raw.state_dict().items() if k in self.ema.shadow}
+            raw.load_state_dict(self.ema.ema_state_dict(self.model))
+            return raw
+
+        def __exit__(self, *exc):
+            raw = self.model.module if isinstance(self.model, DDP) else self.model
+            raw.load_state_dict(self.backup, strict=False)
+            return False
+
+    def apply_to(self, model: nn.Module):
+        return EMA._Swap(self, model)
+
+
+# ---------------------------------------------------------------------------
 # Checkpoints
 # ---------------------------------------------------------------------------
-def save_checkpoint(path: Path, model, optimizer, scaler, step, epoch, best_psnr, args):
+def save_checkpoint(path: Path, model, optimizer, scaler, step, epoch, best_psnr, args, ema: EMA | None = None):
     raw = model.module if isinstance(model, DDP) else model
     tmp = path.with_suffix(".tmp")
     torch.save(
         {
             "model": raw.state_dict(),
+            "ema": ema.state_dict() if ema is not None else None,
             "optimizer": optimizer.state_dict(),
             "scaler": scaler.state_dict() if scaler is not None else None,
             "step": step,
@@ -206,7 +300,7 @@ def save_checkpoint(path: Path, model, optimizer, scaler, step, epoch, best_psnr
     os.replace(tmp, path)
 
 
-def load_checkpoint(path: str | Path, model, optimizer=None, scaler=None, device="cpu") -> dict:
+def load_checkpoint(path: str | Path, model, optimizer=None, scaler=None, device="cpu", ema: EMA | None = None) -> dict:
     path = Path(path)
     if path.is_dir():
         path = path / "last.pth"
@@ -217,14 +311,44 @@ def load_checkpoint(path: str | Path, model, optimizer=None, scaler=None, device
         optimizer.load_state_dict(ckpt["optimizer"])
     if scaler is not None and ckpt.get("scaler") is not None:
         scaler.load_state_dict(ckpt["scaler"])
+    if ema is not None and ckpt.get("ema") is not None:
+        ema.load_state_dict(ckpt["ema"])
     return ckpt
+
+
+def init_from_checkpoint(path: str | Path, model, rank: int, device="cpu") -> None:
+    """Fine-tune: carga sólo pesos.  Prefiere los pesos EMA si existen.
+    Adapta RIFE → RIFE-m (canal t a cero) y tolera inference.pth sin teacher."""
+    path = Path(path)
+    if path.is_dir():
+        path = path / "best.pth"
+    ckpt = torch.load(path, map_location=device, weights_only=False)
+    state = ckpt["model"] if "model" in ckpt else ckpt
+    if ckpt.get("ema") is not None:
+        # el shadow EMA es un dict {nombre: tensor} con las mismas claves
+        state = {**state, **ckpt["ema"]["shadow"]}
+        src = "EMA"
+    else:
+        src = "model"
+    raw = model.module if isinstance(model, DDP) else model
+    info = raw.load_state_dict_compat(state)
+    if is_main(rank):
+        print(f"[train] init_from {path} ({src}): {info['copied']} tensores copiados, "
+              f"{len(info['adapted'])} adaptados RIFE→RIFE-m, {len(info['skipped'])} omitidos")
+        if info["skipped"]:
+            print(f"[train]   omitidos: {info['skipped'][:6]}{' ...' if len(info['skipped']) > 6 else ''}")
 
 
 # ---------------------------------------------------------------------------
 # Validación
 # ---------------------------------------------------------------------------
 @torch.no_grad()
-def validate(model, loader, device, world_size: int, amp: bool) -> dict:
+def validate(model, loader, device, world_size: int, amp: bool, ema: EMA | None = None) -> dict:
+    """PSNR/SSIM en t=0.5 (también para RIFE-m, comparable al benchmark).
+    Si hay EMA, se valida con los pesos EMA (son los que se exportan)."""
+    if ema is not None:
+        with ema.apply_to(model):
+            return validate(model, loader, device, world_size, amp, ema=None)
     raw = model.module if isinstance(model, DDP) else model
     raw.eval()
     tot_psnr = torch.zeros((), device=device)
@@ -236,7 +360,7 @@ def validate(model, loader, device, world_size: int, amp: bool) -> dict:
         img1 = batch["img1"].to(device, non_blocking=True)
         gt = batch["gt"].to(device, non_blocking=True)
         with torch.autocast("cuda", dtype=torch.float16, enabled=amp and device.type == "cuda"):
-            pred = raw.inference(img0, img1)
+            pred = raw.inference(img0, img1, timestep=0.5)
         pred = pred.float()
         tot_psnr += psnr(pred, gt).sum()
         tot_ssim += ssim(pred, gt).sum()
@@ -308,13 +432,24 @@ def main():
 
     # ---------------- Modelo ----------------
     model = RIFE(
-        ifnet_widths=tuple(args.ifnet_widths), refine_c=args.refine_c, use_checkpoint=args.grad_checkpoint
+        ifnet_widths=tuple(args.ifnet_widths),
+        refine_c=args.refine_c,
+        use_checkpoint=args.grad_checkpoint,
+        arbitrary_time=args.arbitrary_time,
+        distill_weight=args.distill_weight,
     ).to(device)
     if is_main(rank):
         n_student = sum(p.numel() for p in model.student_parameters()) / 1e6
-        print(f"[train] parámetros estudiante: {n_student:.2f}M")
+        print(f"[train] parámetros estudiante: {n_student:.2f}M  RIFE-m={args.arbitrary_time}  "
+              f"distill_weight={args.distill_weight}")
+        if args.arbitrary_time and getattr(train_ds, "n_frames", 7) == 3:
+            print("[train] AVISO: --arbitrary_time con dataset triplet → t siempre 0.5; el canal t no aprende nada. "
+                  "Usa vimeo_septuplet.")
+    if args.init_from and not args.resume:
+        init_from_checkpoint(args.init_from, model, rank, device)
     if world_size > 1:
         model = DDP(model, device_ids=[local_rank] if device.type == "cuda" else None)
+    ema = EMA(model, args.ema) if args.ema > 0 else None
 
     # LR escalado linealmente con el nº de GPUs (referencia: 4 GPUs en el paper).
     base_lr = args.lr if args.no_lr_scale else args.lr * world_size / 4
@@ -329,7 +464,7 @@ def main():
     # ---------------- Resume ----------------
     step, start_epoch, best_psnr = 0, 0, -1.0
     if args.resume:
-        ckpt = load_checkpoint(args.resume, model, optimizer, scaler, device)
+        ckpt = load_checkpoint(args.resume, model, optimizer, scaler, device, ema=ema)
         step = ckpt["step"]
         start_epoch = ckpt["epoch"]
         best_psnr = ckpt.get("best_psnr", -1.0)
@@ -370,9 +505,11 @@ def main():
             img0 = batch["img0"].to(device, non_blocking=True)
             img1 = batch["img1"].to(device, non_blocking=True)
             gt = batch["gt"].to(device, non_blocking=True)
+            # (B,) en [0,1]; siempre 0.5 en triplet.  RIFE clásico lo ignora.
+            timestep = batch["timestep"].to(device, non_blocking=True) if args.arbitrary_time else 0.5
 
             with torch.autocast("cuda", dtype=torch.float16, enabled=amp):
-                out = model(img0, img1, gt)
+                out = model(img0, img1, gt, timestep=timestep)
                 loss = out["loss"]
 
             optimizer.zero_grad(set_to_none=True)
@@ -381,6 +518,8 @@ def main():
             grad_norm = nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
             scaler.step(optimizer)
             scaler.update()
+            if ema is not None:
+                ema.update(model)
             step += 1
 
             if not torch.isfinite(loss):
@@ -413,7 +552,7 @@ def main():
 
             # ---- Guardado periódico ----
             if step % args.save_every == 0 and is_main(rank):
-                save_checkpoint(out_dir / "last.pth", model, optimizer, scaler, step, epoch, best_psnr, args)
+                save_checkpoint(out_dir / "last.pth", model, optimizer, scaler, step, epoch, best_psnr, args, ema)
 
             # ---- Límite de tiempo ----
             if time_limit_s and (time.time() - t_start) > time_limit_s:
@@ -429,12 +568,12 @@ def main():
         if stop_early:
             if is_main(rank):
                 print(f"[train] límite de tiempo alcanzado en step {step}; guardando y saliendo")
-                save_checkpoint(out_dir / "last.pth", model, optimizer, scaler, step, epoch, best_psnr, args)
+                save_checkpoint(out_dir / "last.pth", model, optimizer, scaler, step, epoch, best_psnr, args, ema)
             break
 
         # ---- Fin de época: validación + checkpoint ----
         if (epoch + 1) % args.val_every_epochs == 0 or epoch + 1 == args.epochs:
-            metrics = validate(model, val_loader, device, world_size, amp)
+            metrics = validate(model, val_loader, device, world_size, amp, ema)
             if is_main(rank):
                 print(
                     f"[val] epoch {epoch} psnr {metrics['psnr']:.2f} ssim {metrics['ssim']:.4f} "
@@ -447,7 +586,7 @@ def main():
                     writer.add_scalar("val/psnr_avg_baseline", metrics["psnr_avg_baseline"], step)
                 if metrics["psnr"] > best_psnr:
                     best_psnr = metrics["psnr"]
-                    save_checkpoint(out_dir / "best.pth", model, optimizer, scaler, step, epoch + 1, best_psnr, args)
+                    save_checkpoint(out_dir / "best.pth", model, optimizer, scaler, step, epoch + 1, best_psnr, args, ema)
                     print(f"[val] nuevo mejor PSNR {best_psnr:.2f} → best.pth")
                 # Sanity check del smoke test (ver README): si tras entrenar no
                 # superamos el baseline de promediar frames, algo va mal.
@@ -460,12 +599,20 @@ def main():
                     else:
                         print(f"[SMOKE ✓] modelo {metrics['psnr']:.2f} dB > baseline {metrics['psnr_avg_baseline']:.2f} dB")
         if is_main(rank):
-            save_checkpoint(out_dir / "last.pth", model, optimizer, scaler, step, epoch + 1, best_psnr, args)
+            save_checkpoint(out_dir / "last.pth", model, optimizer, scaler, step, epoch + 1, best_psnr, args, ema)
 
     if is_main(rank):
         # Exportamos también pesos "de inferencia" (sin teacher, sin optimizador): más ligero.
+        # Con EMA exportamos los pesos EMA (son los validados).
         raw = model.module if isinstance(model, DDP) else model
-        torch.save({"model": raw.export_inference_state_dict(), "args": vars(args)}, out_dir / "inference.pth")
+        if ema is not None:
+            with ema.apply_to(model):
+                # clone: state_dict() devuelve referencias a los parámetros y al
+                # salir del `with` se restauran los pesos originales in-place.
+                inf_state = {k: v.detach().clone() for k, v in raw.export_inference_state_dict().items()}
+        else:
+            inf_state = raw.export_inference_state_dict()
+        torch.save({"model": inf_state, "args": vars(args)}, out_dir / "inference.pth")
         print(f"[train] fin.  best_psnr={best_psnr:.2f}  checkpoints en {out_dir}")
         if writer:
             writer.close()
