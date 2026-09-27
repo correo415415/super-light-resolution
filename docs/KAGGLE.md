@@ -184,6 +184,7 @@ usarlo en tu 3060 con `inference.py`.
 | La sesión murió y no hay output | No usaste `--time_limit`, o el margen era pequeño.  Usa 11.0 para ir seguro. |
 | Loss NaN | Revisa `--weight_decay 1e-3` (AdamW).  Si persiste, `--lr 2e-4` y `--grad_clip 0.5`. |
 | `FileNotFoundError: .../sequences/00023/0424/im1.png` o `libpng error: IDAT: CRC error` en un worker del DataLoader | El mirror tiene ficheros faltantes/corruptos (el de `maiimaii` al menos uno).  Desde el commit "tolerar PNGs corruptos", `dataset.py` sustituye la muestra y avisa en vez de abortar.  Mide cuántos hay con `python scripts/check_dataset.py --data_root "$DATA" --max_seqs 3000`; si son muchos, `--write_clean_lists /kaggle/working/lists` y entrena con `--list_dir /kaggle/working/lists`. |
+| `Watchdog caught collective operation timeout ... ALLREDUCE` al final de la sesión, `terminate called after throwing c10::DistBackendError` | Deadlock DDP: un rank salió del bucle por `--time_limit` y el otro no (relojes distintos).  Corregido en train.py (rank 0 decide, `broadcast`).  Si te pasa con una versión antigua: `last.pth` de `--save_every` sigue siendo válido; reanuda con él y perderás como mucho 500 pasos. |
 | La celda 1 tarda 40 minutos | `glob('/kaggle/input/**/…', recursive=True)` recorre los 640k ficheros del dataset por el disco de red.  El notebook actual usa una búsqueda acotada por profundidad (segundos). |
 
 ---
@@ -245,6 +246,17 @@ escribió en `/kaggle/working/checkpoints/`, así que su `best.pth` está un niv
 (por eso el glob es recursivo `**`).  Comprueba en la salida de la celda 1 ("Inputs montados") que
 aparecen tanto el dataset como el notebook del run 1; si falta el segundo: *Add Input → Your Work →
 Notebooks → versión del run 1*.
+
+### 9.2b Resultado de la sesión 1 (2026-09-27)
+
+41 épocas, 16 min/época.  Validación t=0.5: 33.70 → **34.23 dB** (EMA), subiendo linealmente.
+`--multi_t`: 28.3 / 26.1 / 25.6 / 26.1 / 28.3 dB (t=1/6…5/6) → el canal t se usa.  Murió en la
+época 42 por el deadlock del `time_limit` (ver §8) pero `last.pth` (step 84 500) y `best.pth`
+(fin de época 41) están en el output.  **Sesión 2**: añade esa versión como input, la celda 1
+detectará `checkpoints_run2/last.pth` y reanudará exactamente en el step 84 500 (mitad de la
+época 42, saltando los batches ya vistos).  Deja `EPOCHS = 90`.  Quedan ~48 épocas ≈ 12.8 h →
+**no caben en una sesión**: hará falta una sesión 3 corta (~2 h), o bajar `EPOCHS` a 80 *ahora*
+(el coseno se recalcula sobre el nuevo total: el LR daría un pequeño salto hacia abajo, inocuo).
 
 ### 9.3 Qué mirar en los resultados
 

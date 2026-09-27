@@ -523,10 +523,18 @@ def main():
                 ema.update(model)
             step += 1
 
-            if not torch.isfinite(loss):
-                print(f"[rank {rank}] loss no finita en step {step}; abortando", file=sys.stderr)
+            # Mismo principio que el time_limit: la decisión de abortar se acuerda
+            # entre ranks (all_reduce MAX) para que todos salgan en el mismo paso.
+            bad = torch.tensor([int(not torch.isfinite(loss))], device=device)
+            if world_size > 1:
+                dist.all_reduce(bad, op=dist.ReduceOp.MAX)
+            if bad.item():
+                print(f"[rank {rank}] loss no finita en step {step} (local finita={torch.isfinite(loss).item()}); abortando", file=sys.stderr)
+                if is_main(rank):
+                    save_checkpoint(out_dir / "last_before_nan.pth", model, optimizer, scaler, step, epoch, best_psnr, args, ema)
                 if world_size > 1:
                     dist.barrier()
+                    dist.destroy_process_group()
                 sys.exit(1)
 
             # ---- Logging ----
@@ -556,15 +564,23 @@ def main():
                 save_checkpoint(out_dir / "last.pth", model, optimizer, scaler, step, epoch, best_psnr, args, ema)
 
             # ---- Límite de tiempo ----
-            if time_limit_s and (time.time() - t_start) > time_limit_s:
-                stop_early = True
-                break
-
-        # Sincronizamos la decisión de parar para que todos los ranks salgan juntos.
-        if world_size > 1:
-            flag = torch.tensor([int(stop_early)], device=device)
-            dist.all_reduce(flag, op=dist.ReduceOp.MAX)
-            stop_early = bool(flag.item())
+            # La decisión la toma SÓLO el rank 0 y se difunde a todos con un
+            # broadcast en el MISMO paso.  Si cada rank mirase su propio reloj,
+            # uno podría salir del bucle (y entrar en un all_reduce de 1
+            # elemento) mientras el otro sigue en backward() (all_reduce de
+            # gradientes): colectivos distintos → deadlock → el watchdog NCCL
+            # mata el proceso a los 10 min y NO se guarda last.pth.  (Pasó en el
+            # run 2, época 41.)  Comprobamos cada `check_every` pasos para no
+            # añadir un broadcast por paso.
+            if time_limit_s and step % 10 == 0:
+                if world_size > 1:
+                    flag = torch.tensor([int((time.time() - t_start) > time_limit_s)], device=device)
+                    dist.broadcast(flag, src=0)
+                    stop_early = bool(flag.item())
+                else:
+                    stop_early = (time.time() - t_start) > time_limit_s
+                if stop_early:
+                    break
 
         if stop_early:
             if is_main(rank):
