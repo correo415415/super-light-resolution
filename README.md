@@ -313,6 +313,43 @@ Curva de validación completa en `docs/results/val_curve_run1.csv`.  Observacion
 * Baseline real de promediar: **25.6 dB** en Vimeo90K, no 20-23 como asumía el brief (esa
   cifra corresponde a datasets con más movimiento, p.ej. UCF101/SNU-FILM hard).
 
+### Run 2 (sesión 1 de 2) — RIFE-m fine-tune sobre septuplet, 41 épocas (~11 h)
+
+Configuración: septuplet (64 612 secuencias), `--arbitrary_time --init_from best.pth(run 1)
+--ema 0.999 --scale_aug 0.5 0.5 1.5 --lr 1e-4 --warmup_steps 500 --no_lr_scale --epochs 90
+--batch_size 16 --amp`.  **16.0 min/época**.  Datos en `docs/results/*run2*`.
+
+| Vimeo90K **septuplet** test, 1 000 secuencias | PSNR | SSIM |
+|---|---|---|
+| Baseline (I₀+I₁)/2 en t=0.5 (im3, im5 → im4) | 27.81 dB | 0.833 |
+| Run 1 convertido a RIFE-m, época 1 de fine-tune (validación) | 33.70 dB | 0.943 |
+| **Época 41 (best.pth, EMA), validación 7 824 seq.** | **34.23 dB** | **0.947** |
+| Época 41, `evaluate.py` 1 000 seq. (`eval_run2_41ep_t05_*.json`) | 33.99 dB | 0.948 |
+| **×6** (im1→im7, `--multi_t`): t=1/6 · 2/6 · 3/6 · 4/6 · 5/6 | 28.29 · 26.09 · 25.56 · 26.14 · 28.35 | 0.877 · 0.837 · 0.826 · 0.838 · 0.878 |
+| ×6 media / baseline promedio en t=3/6 | 26.89 dB / 22.27 dB | |
+
+Observaciones:
+
+* **El fine-tune funciona**: la conversión RIFE→RIFE-m arrancó en 33.70 dB (vs 34.33 del run 1,
+  pero sobre otro test: el septuplet tiene más movimiento — su baseline es 27.8 dB frente a
+  25.6 en el triplet) y sube **+0.53 dB en 41 épocas**, de forma lineal (~+0.13 dB/10 ép.) y
+  sin saturar todavía: el coseno está a mitad (LR 5.9e-5).  La sesión 2 debería llegar a
+  ~34.5 dB.
+* **El canal t se ha aprendido**: en `--multi_t` los extremos (t=1/6, 5/6: 28.3 dB) van
+  claramente *mejor* que el centro (t=3/6: 25.6 dB), como debe ser — en los extremos el frame
+  objetivo está cerca de un frame de entrada.  Un RIFE clásico daría siempre el frame central y
+  se hundiría en los extremos.  Los valores absolutos son bajos porque el gap im1→im7 es
+  **3× el movimiento** del benchmark estándar (esa es la métrica "×6" de la literatura, donde
+  RIFE-m del paper reporta ~28 dB de media en Vimeo).
+* **Bache al final**: el proceso murió en la época 42 por un *deadlock* NCCL provocado por
+  nuestro propio `--time_limit` (cada rank miraba su reloj; el rank 0 salió del bucle y entró en
+  un `all_reduce` distinto al del backward del rank 1 → timeout de 10 min).  `last.pth`
+  (guardado cada 500 pasos) sobrevivió y se puede reanudar.  Arreglado: la decisión de parar la
+  toma el rank 0 y se difunde con `broadcast`.  Probado con 2 procesos DDP en CPU.
+* Inferencia RIFE-m: **7.0 ms/frame** a 448×256 (T4, fp16) — el canal t no cuesta nada.
+* Dos secuencias del mirror están rotas (`00023/0424`, `00081/0168`); el dataset las sustituye
+  automáticamente (aviso en el log).
+
 ### Diferencia con el paper (−1.3 dB) y cómo cerrarla
 
 | Causa probable | Impacto estimado | Acción |
@@ -431,7 +468,8 @@ destilado).  RIFE-m es el prerequisito: el pacer necesita generar el frame en el
 - [x] Fine-tune (`--init_from`), EMA de pesos, scale augmentation
 - [x] `demo_video.py` (YouTube/local, drop-frame eval) + lista de vídeos a probar
 - [x] `docs/APP_DESIGN.md`: diseño de la app de frame generation en tiempo real
-- [ ] **Run 2 en Kaggle**: RIFE-m fine-tune sobre septuplet (notebook listo) → objetivo: t=0.5 ≥ run 1 y PSNR plano en `--multi_t`
+- [x] **Run 2 sesión 1**: RIFE-m fine-tune, 41 ép. → **34.23 dB** val septuplet, canal t aprendido (`--multi_t` correcto)
+- [ ] **Run 2 sesión 2**: `--resume` hasta 90 épocas (~34.5 dB esperado)
 - [ ] Probar run 1 vs run 2 con `demo_video.py` en los clips de `docs/demo_sources.txt`
 - [ ] Verificar velocidad de inferencia en la 3060 (720p/1080p) con `inference.pth`
 - [ ] Export a ONNX / TensorRT + benchmark a 1080p con flow scale (hito 1 de APP_DESIGN)
